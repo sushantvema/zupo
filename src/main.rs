@@ -1,20 +1,28 @@
 mod api;
+mod config;
+mod geolocate;
 mod render;
 
 use std::process;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use colored::Colorize;
 
 use api::client::Client;
 use api::types::*;
+use config::Config;
 
 #[derive(Parser)]
 #[command(
     name = "zupo",
     about = "A Rust CLI for Google Places API (New)",
     version,
-    after_help = "Environment:\n  GOOGLE_PLACES_API_KEY    API key for Google Places (required)"
+    after_help = "Environment:\n  GOOGLE_PLACES_API_KEY    API key for Google Places (required)\n\n\
+    Location resolution (for commands that use --lat/--lng):\n  \
+    1. Explicit --lat/--lng flags (highest priority)\n  \
+    2. Default location from config (~/.config/zupo/config.toml)\n  \
+    3. IP-based geolocation via --auto-locate flag"
 )]
 struct Cli {
     /// Google Places API key (or set GOOGLE_PLACES_API_KEY)
@@ -32,6 +40,10 @@ struct Cli {
     /// HTTP timeout in seconds
     #[arg(long, default_value = "10", global = true)]
     timeout: u64,
+
+    /// Auto-detect location via IP geolocation (fallback if no --lat/--lng or config)
+    #[arg(long, global = true)]
+    auto_locate: bool,
 
     /// Override Places API base URL
     #[arg(long, global = true)]
@@ -70,16 +82,16 @@ enum Commands {
         open_now: bool,
 
         /// Latitude for location bias
-        #[arg(long, requires = "lng")]
+        #[arg(long)]
         lat: Option<f64>,
 
         /// Longitude for location bias
-        #[arg(long, requires = "lat")]
+        #[arg(long)]
         lng: Option<f64>,
 
         /// Radius in meters for location bias
-        #[arg(long, default_value = "5000")]
-        radius: f64,
+        #[arg(long)]
+        radius: Option<f64>,
 
         /// Maximum number of results (1-20)
         #[arg(short, long, default_value = "10")]
@@ -105,16 +117,16 @@ enum Commands {
         session_token: Option<String>,
 
         /// Latitude for location bias
-        #[arg(long, requires = "lng")]
+        #[arg(long)]
         lat: Option<f64>,
 
         /// Longitude for location bias
-        #[arg(long, requires = "lat")]
+        #[arg(long)]
         lng: Option<f64>,
 
         /// Radius in meters for location bias
-        #[arg(long, default_value = "5000")]
-        radius: f64,
+        #[arg(long)]
+        radius: Option<f64>,
 
         /// Maximum number of suggestions
         #[arg(short, long, default_value = "5")]
@@ -131,17 +143,17 @@ enum Commands {
 
     /// Search for places near a location
     Nearby {
-        /// Latitude (required)
+        /// Latitude (uses config/auto-locate if omitted)
         #[arg(long)]
-        lat: f64,
+        lat: Option<f64>,
 
-        /// Longitude (required)
+        /// Longitude (uses config/auto-locate if omitted)
         #[arg(long)]
-        lng: f64,
+        lng: Option<f64>,
 
-        /// Search radius in meters (required)
+        /// Search radius in meters
         #[arg(long)]
-        radius: f64,
+        radius: Option<f64>,
 
         /// Include only these place types
         #[arg(long = "include-type", value_delimiter = ',')]
@@ -267,6 +279,43 @@ enum Commands {
         #[arg(long)]
         region: Option<String>,
     },
+
+    /// Manage zupo configuration
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum ConfigAction {
+    /// Set your default location
+    SetLocation {
+        /// Latitude
+        #[arg(long)]
+        lat: f64,
+
+        /// Longitude
+        #[arg(long)]
+        lng: f64,
+
+        /// Default search radius in meters
+        #[arg(long)]
+        radius: Option<f64>,
+
+        /// Label for this location (e.g., "SoMa Office")
+        #[arg(long)]
+        label: Option<String>,
+    },
+
+    /// Show current configuration
+    Show,
+
+    /// Detect location via IP and save as default
+    AutoDetect,
+
+    /// Clear saved location
+    ClearLocation,
 }
 
 #[tokio::main]
@@ -278,6 +327,12 @@ async fn main() {
 
     if cli.no_color {
         colored::control::set_override(false);
+    }
+
+    // Handle config commands first (don't need API key)
+    if let Commands::Config { ref action } = cli.command {
+        handle_config_command(action).await;
+        return;
     }
 
     let api_key = match cli.api_key {
@@ -305,7 +360,8 @@ async fn main() {
         client = client.with_routes_base_url(url);
     }
 
-    let result = run_command(&client, &cli.command, cli.json).await;
+    let cfg = Config::load();
+    let result = run_command(&client, &cli.command, cli.json, cli.auto_locate, &cfg).await;
     if let Err(e) = result {
         eprintln!("Error: {}", e);
         match e {
@@ -315,10 +371,171 @@ async fn main() {
     }
 }
 
+/// Resolve lat/lng from: explicit flags > config > auto-locate
+async fn resolve_location(
+    explicit_lat: Option<f64>,
+    explicit_lng: Option<f64>,
+    auto_locate: bool,
+    cfg: &Config,
+) -> Option<(f64, f64)> {
+    // 1. Explicit flags
+    if let (Some(lat), Some(lng)) = (explicit_lat, explicit_lng) {
+        return Some((lat, lng));
+    }
+
+    // 2. Config default
+    if let Some((lat, lng)) = cfg.default_location() {
+        let label = cfg.location.label.as_deref().unwrap_or("config");
+        eprintln!(
+            "{}",
+            format!("Using saved location ({}) [{:.4}, {:.4}]", label, lat, lng).dimmed()
+        );
+        return Some((lat, lng));
+    }
+
+    // 3. IP-based auto-locate
+    if auto_locate {
+        eprintln!("{}", "Auto-detecting location via IP...".dimmed());
+        match geolocate::geolocate_by_ip().await {
+            Ok(geo) => {
+                eprintln!(
+                    "{}",
+                    format!(
+                        "Detected: {} [{:.4}, {:.4}]",
+                        geo.description, geo.lat, geo.lng
+                    )
+                    .dimmed()
+                );
+                return Some((geo.lat, geo.lng));
+            }
+            Err(e) => {
+                eprintln!("{}", format!("Auto-locate failed: {}", e).yellow());
+            }
+        }
+    }
+
+    None
+}
+
+/// Resolve radius from: explicit flag > config default > fallback
+fn resolve_radius(explicit: Option<f64>, cfg: &Config, fallback: f64) -> f64 {
+    explicit.unwrap_or_else(|| {
+        cfg.location
+            .default_radius
+            .unwrap_or(fallback)
+    })
+}
+
+async fn handle_config_command(action: &ConfigAction) {
+    match action {
+        ConfigAction::SetLocation {
+            lat,
+            lng,
+            radius,
+            label,
+        } => {
+            let mut cfg = Config::load();
+            cfg.set_location(*lat, *lng, *radius, label.clone());
+            match cfg.save() {
+                Ok(()) => {
+                    println!("Location saved to {}", config::config_file_path());
+                    println!("  Lat: {}", lat);
+                    println!("  Lng: {}", lng);
+                    if let Some(r) = radius {
+                        println!("  Radius: {}m", r);
+                    }
+                    if let Some(ref l) = label {
+                        println!("  Label: {}", l);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    process::exit(1);
+                }
+            }
+        }
+
+        ConfigAction::Show => {
+            let cfg = Config::load();
+            let path = config::config_file_path();
+            println!("{} {}", "Config file:".bold(), path);
+            println!();
+            if let Some((lat, lng)) = cfg.default_location() {
+                println!("  {}", "Default Location".bold());
+                if let Some(ref label) = cfg.location.label {
+                    println!("    {} {}", "Label:".dimmed(), label);
+                }
+                println!("    {} {}", "Lat:".dimmed(), lat);
+                println!("    {} {}", "Lng:".dimmed(), lng);
+                println!(
+                    "    {} {}m",
+                    "Radius:".dimmed(),
+                    cfg.default_radius()
+                );
+            } else {
+                println!(
+                    "  {}",
+                    "No default location set. Use `zupo config set-location` or `zupo config auto-detect`.".dimmed()
+                );
+            }
+        }
+
+        ConfigAction::AutoDetect => {
+            eprintln!("Detecting location via IP...");
+            match geolocate::geolocate_by_ip().await {
+                Ok(geo) => {
+                    let mut cfg = Config::load();
+                    cfg.set_location(
+                        geo.lat,
+                        geo.lng,
+                        Some(5000.0),
+                        Some(geo.description.clone()),
+                    );
+                    match cfg.save() {
+                        Ok(()) => {
+                            println!("Location auto-detected and saved:");
+                            println!("  {} {}", "Location:".bold(), geo.description);
+                            println!("  {} {}", "Lat:".dimmed(), geo.lat);
+                            println!("  {} {}", "Lng:".dimmed(), geo.lng);
+                            println!(
+                                "  {}",
+                                "Note: IP geolocation is approximate. Use `zupo config set-location` for exact coords."
+                                    .yellow()
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("Error saving config: {}", e);
+                            process::exit(1);
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    process::exit(1);
+                }
+            }
+        }
+
+        ConfigAction::ClearLocation => {
+            let mut cfg = Config::load();
+            cfg.clear_location();
+            match cfg.save() {
+                Ok(()) => println!("Default location cleared."),
+                Err(e) => {
+                    eprintln!("Error: {}", e);
+                    process::exit(1);
+                }
+            }
+        }
+    }
+}
+
 async fn run_command(
     client: &Client,
     command: &Commands,
     json_output: bool,
+    auto_locate: bool,
+    cfg: &Config,
 ) -> Result<(), api::errors::Error> {
     match command {
         Commands::Search {
@@ -334,12 +551,13 @@ async fn run_command(
             lang,
             region,
         } => {
-            let location = lat.zip(*lng).map(|(la, ln)| Circle {
+            let resolved = resolve_location(*lat, *lng, auto_locate, cfg).await;
+            let location = resolved.map(|(la, ln)| Circle {
                 center: LatLng {
                     latitude: la,
                     longitude: ln,
                 },
-                radius: *radius,
+                radius: resolve_radius(*radius, cfg, 5000.0),
             });
 
             let price_levels: Vec<String> = price_level
@@ -378,12 +596,13 @@ async fn run_command(
             lang,
             region,
         } => {
-            let location = lat.zip(*lng).map(|(la, ln)| Circle {
+            let resolved = resolve_location(*lat, *lng, auto_locate, cfg).await;
+            let location = resolved.map(|(la, ln)| Circle {
                 center: LatLng {
                     latitude: la,
                     longitude: ln,
                 },
-                radius: *radius,
+                radius: resolve_radius(*radius, cfg, 5000.0),
             });
 
             let req = AutocompleteRequest {
@@ -414,10 +633,17 @@ async fn run_command(
             lang,
             region,
         } => {
+            let resolved = resolve_location(*lat, *lng, auto_locate, cfg).await;
+            let (rlat, rlng) = resolved.ok_or_else(|| api::errors::Error::Validation {
+                field: "lat/lng".into(),
+                message: "location required: use --lat/--lng, set a default with `zupo config set-location`, or use --auto-locate".into(),
+            })?;
+            let rradius = resolve_radius(*radius, cfg, 1000.0);
+
             let req = NearbySearchRequest {
-                lat: *lat,
-                lng: *lng,
-                radius: *radius,
+                lat: rlat,
+                lng: rlng,
+                radius: rradius,
                 included_types: include_types.clone(),
                 excluded_types: exclude_types.clone(),
                 limit: Some(*limit),
@@ -557,6 +783,8 @@ async fn run_command(
                 render::render_places(&resp.places, "Resolved Places");
             }
         }
+
+        Commands::Config { .. } => unreachable!(),
     }
 
     Ok(())
