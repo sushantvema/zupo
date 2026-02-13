@@ -2,6 +2,7 @@ mod api;
 mod config;
 mod geolocate;
 mod render;
+mod tui;
 
 use std::process;
 use std::time::Duration;
@@ -285,6 +286,9 @@ enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
+
+    /// Launch interactive TUI mode
+    Tui,
 }
 
 #[derive(Subcommand)]
@@ -361,6 +365,16 @@ async fn main() {
     }
 
     let cfg = Config::load();
+
+    // Handle TUI mode
+    if let Commands::Tui = cli.command {
+        if let Err(e) = tui::run(client, cfg).await {
+            eprintln!("Error: {}", e);
+            process::exit(1);
+        }
+        return;
+    }
+
     let result = run_command(&client, &cli.command, cli.json, cli.auto_locate, &cfg).await;
     if let Err(e) = result {
         eprintln!("Error: {}", e);
@@ -784,7 +798,7 @@ async fn run_command(
             }
         }
 
-        Commands::Config { .. } => unreachable!(),
+        Commands::Config { .. } | Commands::Tui => unreachable!(),
     }
 
     Ok(())

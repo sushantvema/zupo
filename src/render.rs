@@ -451,7 +451,7 @@ pub fn render_route(response: &RouteSearchResponse) {
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-fn star_string(rating: f64) -> String {
+pub fn star_string(rating: f64) -> String {
     let full = rating.floor() as usize;
     let half = if rating - rating.floor() >= 0.5 { 1 } else { 0 };
     let empty = 5usize.saturating_sub(full + half);
@@ -463,7 +463,7 @@ fn star_string(rating: f64) -> String {
     )
 }
 
-fn truncate(s: &str, max_len: usize) -> &str {
+pub fn truncate(s: &str, max_len: usize) -> &str {
     if s.len() <= max_len {
         s
     } else {
