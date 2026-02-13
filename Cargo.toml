@@ -18,3 +18,11 @@ viuer = "0.9"
 image = "0.25"
 toml = "0.8"
 dirs = "6"
+ratatui = "0.29"
+crossterm = { version = "0.28", features = ["event-stream"] }
+tui-input = "0.11"
+futures = "0.3"
+uuid = { version = "1", features = ["v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt"] }
+tracing-appender = "0.2"
